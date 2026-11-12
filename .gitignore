@@ -1,0 +1,40 @@
+# 构建产物
+bin/
+cover.out
+*.test
+
+# 前端（M6，SPEC-WEB-001）
+# dist 下的产物不入库，但 .gitkeep 必须提交：go:embed all:dist 在干净克隆上
+# 找不到目录会直接编译失败（AC-01），所以两个 dist 都要保留占位文件。
+web/node_modules/
+web/dist/*
+!web/dist/.gitkeep
+internal/adapter/http/webui/dist/*
+!internal/adapter/http/webui/dist/.gitkeep
+*.tsbuildinfo
+
+# 本地配置（含数据库凭据，永不入库）
+.env
+.env.*
+!.env.example
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# Agent 内部记忆（不进版本控制）
+.workbuddy/
+
+# Playwright 产物（M6-E）
+web/test-results/
+web/playwright-report/
+web/blob-report/
+web/.playwright/
+
+# CLI 二进制（本机构建产物）
+/regtoctl.exe

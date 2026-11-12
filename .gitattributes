@@ -1,0 +1,21 @@
+# 统一行尾：仓库内一律 LF，检出时不按平台自动转换。
+# 目的：Windows 开发机（默认 CRLF）与 CI/Linux 之间不产生全文件 diff 噪音，
+# 也让留痕 jsonl 的 hash 链不受行尾变化影响（文件内容必须与写入时一致）。
+
+* text=auto eol=lf
+
+*.go    text eol=lf
+*.md    text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.sql   text eol=lf
+*.json  text eol=lf
+*.jsonl text eol=lf
+Makefile text eol=lf
+
+# 二进制文件不做任何转换
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.pdf binary

@@ -1,0 +1,3666 @@
+openapi: 3.1.0
+
+# Regto API v1 契约（唯一真源）
+#
+# 纪律（AGENTS.md §5 / ROADMAP §3.4）：
+#   1. 本文件是接口契约的唯一真源，新增/修改路由必须先改这里，再改代码；
+#   2. tests/unit/openapi 会在 CI 中校验「契约路径 ⊆ 路由树」且「路由树 ⊆ 契约路径」，
+#      二者不一致直接红灯——防止契约先腐化；
+#   3. 本文件不生成代码（oapi-codegen 属 P1 后续项），仅用于文档与契约校验。
+
+info:
+  title: Regto API
+  version: 1.0.0
+  summary: 绳直（Regto）项目协作开发管理 API
+  description: |
+    Regto 是面向「人类 + AI Agent」双主体的项目协作开发管理系统，
+    核心是 SpecDD（规格驱动开发）：需求、设计、测试三份规格文档联动，
+    所有变更留痕进 hash 链。
+
+    ## 约定
+    - 基路径 `/api/v1`，资源名复数。
+    - 时间统一 **RFC3339 UTC**；领域内部存 unix 毫秒，出口转换。
+    - 集合恒定包裹在 `data` 键下，分页信息在 `page`，导航在 `links`。
+    - 错误统一 **RFC 7807** `application/problem+json`。
+    - 业务规则拒绝（非法状态转移、阶段回退等）统一 **422**；
+      请求格式问题（非法 JSON、非法查询参数）为 **400**。
+
+    ## 认证
+    除 `/healthz`、`/readyz`、登录与刷新外，全部接口需要凭据：
+    - `Authorization: Bearer <JWT>`（人类 / AI 会话令牌，15 分钟有效）
+    - `X-Regto-Api-Key: <key>`（AI Agent 长期凭据，创建时仅回显一次）
+
+    ## 执行主体
+    主体的 `kind` 取值 `human` / `ai` / `system`，写进每一次变更的 activities 与留痕链。
+  license:
+    name: Proprietary
+
+servers:
+  - url: http://localhost:8080
+    description: 本地开发
+
+tags:
+  - name: system
+    description: 健康与就绪探针
+  - name: auth
+    description: 认证与凭据管理
+  - name: stories
+    description: 需求（Story）域
+  - name: cases
+    description: 测试用例域（用例/步骤/套件与 ZTF 导入导出）
+  - name: test-tasks
+    description: 测试执行域（测试单/执行结果）
+  - name: plans
+    description: 产品计划域（plan/plan_stories）
+  - name: releases
+    description: 发布域（release）
+  - name: builds
+    description: 构建域（build，记录型实体无状态机）
+
+security:
+  - bearerAuth: []
+  - apiKeyAuth: []
+
+paths:
+  /healthz:
+    get:
+      tags: [system]
+      operationId: healthz
+      summary: 进程存活探针
+      description: 不依赖任何外部组件，仅证明进程在跑。
+      security: []
+      responses:
+        "200":
+          description: 进程存活
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                required: [status]
+
+  /readyz:
+    get:
+      tags: [system]
+      operationId: readyz
+      summary: 就绪探针
+      description: 校验 PostgreSQL（必选）与 Redis（未启用时值为 disabled）连通性。
+      security: []
+      responses:
+        "200":
+          description: 全部依赖可用
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  postgres:
+                    type: string
+                    enum: [ok]
+                  redis:
+                    type: string
+                    enum: [ok, disabled]
+                required: [postgres]
+        "503":
+          description: 依赖不可用
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/auth/login:
+    post:
+      tags: [auth]
+      operationId: login
+      summary: 账号密码登录换取令牌对
+      description: |
+        成功时除响应体外，还下发 `Set-Cookie: regto_refresh`（`HttpOnly; SameSite=Lax;
+        Path=/api/v1/auth`，Max-Age 与 refresh 有效期一致）。
+        浏览器客户端只读 `access_token`，refresh 走 cookie；SDK / CLI 用响应体里的
+        `refresh_token`（兼容保留）。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: 登录成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenPair"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/v1/auth/refresh:
+    post:
+      tags: [auth]
+      operationId: refresh
+      summary: 用 refresh token 换新令牌对
+      description: |
+        刷新令牌**单次有效**（REQ-02）：用后立即失效，重放同一令牌返回 401 并连坐撤销整个 family。
+
+        令牌来源优先级 **cookie > 请求体**：浏览器带 `regto_refresh` cookie 即可，
+        请求体可省略；SDK / CLI 没有 cookie，用请求体传 `refresh_token`。
+        来源为 cookie 时响应会回写新的 `Set-Cookie`（轮换），来源为请求体时不回写。
+
+        拦截浏览器跨站请求：`Origin` 存在且既非同源、也不在
+        `REGTO_WEB_ALLOWED_ORIGINS` 白名单内时返回 403 `ORIGIN_NOT_ALLOWED`。
+        不带 `Origin` 的请求（curl / SDK）一律放行。
+      security: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefreshRequest"
+      responses:
+        "200":
+          description: 刷新成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenPair"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /api/v1/auth/logout:
+    post:
+      tags: [auth]
+      operationId: logout
+      summary: 登出并撤销当前会话的 refresh family
+      description: |
+        撤销 cookie（或请求体）里 refresh token 所属的**整个 family**，并清除 cookie。
+        幂等：令牌缺失、已过期、已撤销都返回 204——登出的语义是「确保这个会话不再能续期」，
+        对已失效的会话报错只会让前端在续期竞态里吞错误。
+
+        只影响当前设备：其他设备的会话不受影响。
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefreshRequest"
+      responses:
+        "204":
+          description: 已登出（无论此前会话是否仍然有效）
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /api/v1/auth/me:
+    get:
+      tags: [auth]
+      operationId: me
+      summary: 当前会话主体与角色
+      description: |
+        返回调用者自身的主体信息与角色码。`roles` **仅供前端菜单粗筛**（REQ-07），
+        不是权限判定依据——后端 ACLGuard 才是唯一判定源。
+        API Key / AI 主体调用时 `roles` 为空数组。
+      responses:
+        "200":
+          description: 当前主体
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeResponse"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+
+  /api/v1/auth/embed-token:
+    post:
+      tags: [auth]
+      operationId: embedToken
+      summary: 为当前主体签发一枚短 TTL 嵌入令牌（mo-mind 嵌入位）
+      description: |
+        签的是**调用者自己**，权限与调用者原有的一致，不产生任何提权
+        （DESIGN-WEB-001#DEC-14）。保护来自两处：TTL 默认 5 分钟（上限 30 分钟），
+        以及传输通道——前端必须经 postMessage 交给 iframe，
+        **绝不能放进 URL query**（URL 会落到 referer、访问日志与浏览器历史）。
+        校验方式与 access token 完全一致，mo-mind 侧无需新的验签逻辑。
+      responses:
+        "200":
+          description: 嵌入令牌
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EmbedTokenResponse"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+  /api/v1/auth/api-keys:
+    post:
+      tags: [auth]
+      operationId: createAPIKey
+      summary: 创建 API Key
+      description: |
+        明文密钥**仅在创建响应中返回一次**（REQ-03），服务端只存 SHA-256 摘要。
+        `subject_kind` 缺省时按是否带 `agent_id` 推断：带则 `ai`，不带则 `human`。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAPIKeyRequest"
+      responses:
+        "201":
+          description: 创建成功（含一次性明文）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/APIKey"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /api/v1/auth/api-keys/{id}:
+    delete:
+      tags: [auth]
+      operationId: revokeAPIKey
+      summary: 吊销 API Key
+      description: 软吊销（状态置 revoked），不物理删除——审计要求（NFR-03）。
+      parameters:
+        - $ref: "#/components/parameters/IDPath"
+      responses:
+        "204":
+          description: 已吊销
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/stories:
+    get:
+      tags: [stories]
+      operationId: listStories
+      summary: 需求列表（分页 / 筛选 / 排序）
+      description: |
+        - 默认排序 `-created_at`；可多字段排序，如 `sort=-pri,created_at`。
+        - 越界分页参数**截断**到允许范围（1–200），非法枚举**拒绝**返回 400。
+        - 默认排除软删记录，`include_deleted=true` 时纳入并在行上返回 `deleted: true`。
+      parameters:
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/PerPage"
+        - $ref: "#/components/parameters/Sort"
+        - $ref: "#/components/parameters/Keyword"
+        - $ref: "#/components/parameters/StatusFilter"
+        - $ref: "#/components/parameters/StageFilter"
+        - $ref: "#/components/parameters/TypeFilter"
+        - $ref: "#/components/parameters/ProductID"
+        - $ref: "#/components/parameters/ModuleID"
+        - $ref: "#/components/parameters/AssignedToID"
+        - $ref: "#/components/parameters/OpenedByID"
+        - $ref: "#/components/parameters/IncludeDeleted"
+      responses:
+        "200":
+          description: 列表（空结果时 data 为 []，不为 null）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StoryList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+
+    post:
+      tags: [stories]
+      operationId: createStory
+      summary: 创建需求
+      description: |
+        `as_draft=true` 时以草稿态创建并**显式**把 `reviewers` 作为预设评审人（DEC-10），
+        优先级高于产品/模块默认评审人。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateStoryRequest"
+      responses:
+        "201":
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Story"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /api/v1/stories/{id}:
+    get:
+      tags: [stories]
+      operationId: getStory
+      summary: 需求详情
+      description: 含当前规格版本（`current_spec`）快照。
+      parameters:
+        - $ref: "#/components/parameters/IDPath"
+      responses:
+        "200":
+          description: 需求详情
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Story"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/stories/{id}/transitions:
+    post:
+      tags: [stories]
+      operationId: transitionStory
+      summary: 状态转移统一入口
+      description: |
+        所有状态变更走此单一入口（ROADMAP §3.4 关键差异 1），
+        非法转移返回 **422** 且 `meta.allowed` 列出当前状态允许的合法动作。
+
+        | action | 语义 |
+        |---|---|
+        | `create` | 草稿 → 激活（跳过评审） |
+        | `submitReview` | 提交评审：草稿/变更中 → 评审中 |
+        | `reviewPass` | 评审通过 → 激活 |
+        | `reviewClarify` | 评审待澄清 → 回到前一状态 |
+        | `reviewRevert` | 评审回退版本 → 规格版本 -1 |
+        | `reviewReject` | 评审拒绝 → 关闭（reason=reviewrejected） |
+        | `change` | 激活 → 变更中（产生新规格版本） |
+        | `activate` | 变更中 → 激活 |
+        | `close` | 关闭（需 close_reason） |
+
+        评审结果经 `review_results` 聚合（DEC-09）：与需求同事务落库，
+        非法评审不会留下孤立单据。
+      parameters:
+        - $ref: "#/components/parameters/IDPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TransitionRequest"
+      responses:
+        "200":
+          description: 转移成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Story"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /api/v1/stories/{id}/stage:
+    post:
+      tags: [stories]
+      operationId: advanceStage
+      summary: 推进研发阶段
+      description: |
+        可跳级、**不可回退**、不可原地踏步（REQ-06）。
+        回退或原地推进返回 422，并带 `meta.from` / `meta.to`。
+      parameters:
+        - $ref: "#/components/parameters/IDPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdvanceStageRequest"
+      responses:
+        "200":
+          description: 推进成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Story"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  # ---------- 用例域（SPEC-CASE-001） ----------
+
+  /api/v1/cases:
+    get:
+      tags: [cases]
+      operationId: listCases
+      summary: 用例列表（分页 / 筛选 / 排序）
+      description: |
+        排序允许字段：`id` `title` `pri` `status` `type` `created_at` `updated_at`，
+        缺省 `-created_at`。`status`/`type` 为**单值**枚举筛选（与 story 的逗号分隔不同），
+        非法值返回 400。空结果 `data` 为 `[]`。
+      parameters:
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/PerPage"
+        - $ref: "#/components/parameters/CaseSort"
+        - $ref: "#/components/parameters/Keyword"
+        - $ref: "#/components/parameters/CaseStatusFilter"
+        - $ref: "#/components/parameters/CaseTypeFilter"
+        - $ref: "#/components/parameters/ProductID"
+        - $ref: "#/components/parameters/ModuleID"
+        - $ref: "#/components/parameters/StoryID"
+        - $ref: "#/components/parameters/ExternalID"
+      responses:
+        "200":
+          description: 列表
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CaseList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+
+    post:
+      tags: [cases]
+      operationId: createCase
+      summary: 创建用例（初始状态 wait）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateCaseRequest"
+      responses:
+        "201":
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Case"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /api/v1/cases/import-ztf:
+    post:
+      tags: [cases]
+      operationId: importCasesZTF
+      summary: 从 ZTF 文本批量导入用例（REQ-05）
+      description: |
+        ZTF 规范形式见 DESIGN-CASE-001：`>>>` 标题行（标题 = 首个 `@` 属性前的全部文本，
+        可含空格）、`***` 步骤、`>>` 检查点、`**` 分组步骤；空行分隔用例块。
+        语法错误返回 400 `INVALID_ZTF` 且 `meta.line` 指出首个错误行（AC-03）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ImportZTFRequest"
+      responses:
+        "201":
+          description: 导入完成
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportZTFResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+
+  /api/v1/cases/{id}:
+    get:
+      tags: [cases]
+      operationId: getCase
+      summary: 用例详情（含步骤）
+      parameters:
+        - $ref: "#/components/parameters/IDPath"
+      responses:
+        "200":
+          description: 用例详情
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Case"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+    put:
+      tags: [cases]
+      operationId: updateCase
+      summary: 修改用例主数据（不动步骤）
+      description: 全字段可选，空值不覆盖原值；并发修改由乐观锁拦截（412）。
+      parameters:
+        - $ref: "#/components/parameters/IDPath"
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateCaseRequest"
+      responses:
+        "200":
+          description: 修改成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Case"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /api/v1/cases/{id}/transitions:
+    post:
+      tags: [cases]
+      operationId: transitionCase
+      summary: 用例状态转移统一入口
+      description: |
+        四态状态机：`wait → normal → blocked ⇄ investigate`（REQ-04）。
+        非法转移返回 422 且 `meta.allowed` 列出合法动作（AC-02）。
+
+        | action | 语义 |
+        |---|---|
+        | `activate` | wait → normal |
+        | `block` | normal/investigate → blocked |
+        | `investigate` | normal/blocked → investigate |
+        | `resume` | blocked/investigate → normal |
+      parameters:
+        - $ref: "#/components/parameters/IDPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CaseTransitionRequest"
+      responses:
+        "200":
+          description: 转移成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Case"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /api/v1/cases/{id}/export-ztf:
+    get:
+      tags: [cases]
+      operationId: exportCaseZTF
+      summary: 导出用例为 ZTF 文本（REQ-06）
+      description: |
+        `text/plain; charset=utf-8`。导出为规范形式（UTF-8、LF、单换行结束），
+        round-trip 逐字节一致（AC-01）。
+      parameters:
+        - $ref: "#/components/parameters/IDPath"
+      responses:
+        "200":
+          description: ZTF 文本
+          content:
+            text/plain:
+              schema:
+                type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ---------- 套件（REQ-03） ----------
+
+  /api/v1/suites:
+    post:
+      tags: [cases]
+      operationId: createSuite
+      summary: 创建用例套件（同产品下同名唯一）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSuiteRequest"
+      responses:
+        "201":
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Suite"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /api/v1/suites/{id}/cases:
+    post:
+      tags: [cases]
+      operationId: addSuiteCases
+      summary: 把用例加入套件（记录版本快照）
+      description: 同一套件内重复加入同一用例返回 409 `SUITE_CASE_CONFLICT`。
+      parameters:
+        - $ref: "#/components/parameters/IDPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AddSuiteCaseRequest"
+      responses:
+        "201":
+          description: 加入成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuiteCase"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  # ---------- 测试执行域（SPEC-TESTTASK-001） ----------
+
+  /api/v1/test-tasks:
+    get:
+      tags: [test-tasks]
+      operationId: listTestTasks
+      summary: 测试单列表（分页 / 筛选）
+      parameters:
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/PerPage"
+        - $ref: "#/components/parameters/Keyword"
+        - $ref: "#/components/parameters/TaskStatusFilter"
+        - $ref: "#/components/parameters/ProductID"
+      responses:
+        "200":
+          description: 列表
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TestTaskList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+
+    post:
+      tags: [test-tasks]
+      operationId: createTestTask
+      summary: 创建测试单（初始状态 wait）
+      description: "`owner_id` 缺省取当前执行主体 ID。"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateTestTaskRequest"
+      responses:
+        "201":
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TestTask"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /api/v1/test-tasks/{id}:
+    get:
+      tags: [test-tasks]
+      operationId: getTestTask
+      summary: 测试单详情
+      parameters:
+        - $ref: "#/components/parameters/IDPath"
+      responses:
+        "200":
+          description: 测试单详情
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TestTask"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/test-tasks/{id}/transitions:
+    post:
+      tags: [test-tasks]
+      operationId: transitionTestTask
+      summary: 测试单状态转移统一入口
+      description: |
+        四态状态机：`wait → doing ⇄ blocked`，`done` 为终态（REQ-01）。
+        导入结果时测试单不在 `doing` 会**自动 start**（导入即开始执行）。
+
+        | action | 语义 |
+        |---|---|
+        | `start` | wait/blocked → doing |
+        | `finish` | doing/blocked → done |
+        | `block` | wait/doing → blocked |
+      parameters:
+        - $ref: "#/components/parameters/IDPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TestTaskTransitionRequest"
+      responses:
+        "200":
+          description: 转移成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TestTask"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /api/v1/test-tasks/{id}/cases:
+    get:
+      tags: [test-tasks]
+      operationId: listTestTaskCases
+      summary: 测试单内的用例及执行状态
+      parameters:
+        - $ref: "#/components/parameters/IDPath"
+      responses:
+        "200":
+          description: 用例列表
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskCaseList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+    post:
+      tags: [test-tasks]
+      operationId: addTestTaskCases
+      summary: 把用例加入测试单（锁定当前版本快照）
+      parameters:
+        - $ref: "#/components/parameters/IDPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AddCasesRequest"
+      responses:
+        "201":
+          description: 加入成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  added:
+                    type: integer
+                    description: 实际新增数（已存在的不重复计）
+                required: [added]
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/test-tasks/{id}/import-result:
+    post:
+      tags: [test-tasks]
+      operationId: importTestResult
+      summary: 导入 go test -json 执行结果（REQ-04~07）
+      description: |
+        事件流按 `Package + "/" + Test` 聚合（REQ-04.5：同一 Test 的多次结论后者覆盖；
+        剔除包级事件）。按 `product_id + external_id`（如 go 测试函数名）匹配用例；
+        未匹配且未开 `create_missing` 时返回 400 `UNMATCHED_TESTS`
+        （`meta.unmatched` 列出全部未匹配名，默认失败不留「以为导入了」的空间）。
+        测试单不在 `doing` 时自动 start。`run_no` 缺省取已有最大 + 1（DEC-07），
+        显式传值可复现（同一 job 重传同一 run_no → 覆盖）。
+      parameters:
+        - $ref: "#/components/parameters/IDPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ImportResultRequest"
+      responses:
+        "201":
+          description: 导入完成
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportResultResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/test-tasks/{id}/results:
+    get:
+      tags: [test-tasks]
+      operationId: listTestResults
+      summary: 执行结果列表（分页）
+      parameters:
+        - $ref: "#/components/parameters/IDPath"
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/PerPage"
+      responses:
+        "200":
+          description: 结果列表
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResultList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/test-tasks/{id}/summary:
+    get:
+      tags: [test-tasks]
+      operationId: summarizeTestTask
+      summary: 测试单结果汇总（各结果计数，只看每用例最新一轮）
+      parameters:
+        - $ref: "#/components/parameters/IDPath"
+      responses:
+        "200":
+          description: 汇总
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    description: 结果 → 数量（键为 pass/fail/blocked/skip/n/a）
+                    additionalProperties:
+                      type: integer
+                required: [data]
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ---------- 发布域：产品计划（SPEC-RELEASE-001 REQ-01/02/03） ----------
+
+  /api/v1/plans:
+    get:
+      tags: [plans]
+      operationId: listPlans
+      summary: 产品计划列表
+      parameters:
+        - name: product_id
+          in: query
+          description: 按产品筛选
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+        - name: status
+          in: query
+          description: 按状态筛选
+          schema:
+            type: string
+            enum: [wait, doing, done, closed]
+        - name: keyword
+          in: query
+          description: 标题模糊匹配
+          schema:
+            type: string
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/PerPage"
+        - $ref: "#/components/parameters/Sort"
+      responses:
+        "200":
+          description: 计划列表
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlanList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+    post:
+      tags: [plans]
+      operationId: createPlan
+      summary: 创建产品计划（初始状态 wait）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatePlanRequest"
+      responses:
+        "201":
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Plan"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /api/v1/plans/{id}:
+    get:
+      tags: [plans]
+      operationId: getPlan
+      summary: 产品计划详情
+      parameters:
+        - $ref: "#/components/parameters/IDPath"
+      responses:
+        "200":
+          description: 计划详情
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Plan"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      tags: [plans]
+      operationId: updatePlan
+      summary: 修改产品计划主数据（状态只能经 transitions 变更）
+      parameters:
+        - $ref: "#/components/parameters/IDPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdatePlanRequest"
+      responses:
+        "200":
+          description: 修改后的计划
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Plan"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /api/v1/plans/{id}/transitions:
+    post:
+      tags: [plans]
+      operationId: transitionPlan
+      summary: 产品计划状态转移（start/finish/close/activate）
+      parameters:
+        - $ref: "#/components/parameters/IDPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PlanTransitionRequest"
+      responses:
+        "200":
+          description: 转移后的计划
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Plan"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /api/v1/plans/{id}/stories:
+    get:
+      tags: [plans]
+      operationId: listPlanStories
+      summary: 计划下的需求列表（按 order 升序）
+      parameters:
+        - $ref: "#/components/parameters/IDPath"
+      responses:
+        "200":
+          description: 需求关联列表
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlanStoryList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      tags: [plans]
+      operationId: linkPlanStory
+      summary: 计划关联需求（重复关联 409 PLAN_STORY_CONFLICT）
+      parameters:
+        - $ref: "#/components/parameters/IDPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LinkPlanStoryRequest"
+      responses:
+        "204":
+          description: 已关联
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  # ---------- 发布域：发布（SPEC-RELEASE-001 REQ-04/05） ----------
+
+  /api/v1/releases:
+    get:
+      tags: [releases]
+      operationId: listReleases
+      summary: 发布列表
+      parameters:
+        - name: product_id
+          in: query
+          description: 按产品筛选
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+        - name: status
+          in: query
+          description: 按状态筛选
+          schema:
+            type: string
+            enum: [wait, normal, fail, terminate]
+        - name: keyword
+          in: query
+          description: 名称模糊匹配
+          schema:
+            type: string
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/PerPage"
+        - $ref: "#/components/parameters/Sort"
+      responses:
+        "200":
+          description: 发布列表
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReleaseList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+    post:
+      tags: [releases]
+      operationId: createRelease
+      summary: 创建发布（初始状态 wait）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateReleaseRequest"
+      responses:
+        "201":
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Release"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /api/v1/releases/{id}:
+    get:
+      tags: [releases]
+      operationId: getRelease
+      summary: 发布详情
+      parameters:
+        - $ref: "#/components/parameters/IDPath"
+      responses:
+        "200":
+          description: 发布详情
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Release"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      tags: [releases]
+      operationId: updateRelease
+      summary: 修改发布主数据（状态只能经 transitions 变更）
+      parameters:
+        - $ref: "#/components/parameters/IDPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateReleaseRequest"
+      responses:
+        "200":
+          description: 修改后的发布
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Release"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /api/v1/releases/{id}/transitions:
+    post:
+      tags: [releases]
+      operationId: transitionRelease
+      summary: 发布状态转移（publish/pause/terminate/play）
+      parameters:
+        - $ref: "#/components/parameters/IDPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReleaseTransitionRequest"
+      responses:
+        "200":
+          description: 转移后的发布
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Release"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  # ---------- 发布域：构建（SPEC-RELEASE-001 REQ-06；无状态机） ----------
+
+  /api/v1/builds:
+    get:
+      tags: [builds]
+      operationId: listBuilds
+      summary: 构建列表
+      parameters:
+        - name: product_id
+          in: query
+          description: 按产品筛选
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+        - name: keyword
+          in: query
+          description: 名称模糊匹配
+          schema:
+            type: string
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/PerPage"
+        - $ref: "#/components/parameters/Sort"
+      responses:
+        "200":
+          description: 构建列表
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BuildList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+    post:
+      tags: [builds]
+      operationId: createBuild
+      summary: 创建构建（构建号产品内唯一，重复 409 BUILD_CONFLICT）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateBuildRequest"
+      responses:
+        "201":
+          description: 已创建
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Build"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /api/v1/builds/{id}:
+    get:
+      tags: [builds]
+      operationId: getBuild
+      summary: 构建详情
+      parameters:
+        - $ref: "#/components/parameters/IDPath"
+      responses:
+        "200":
+          description: 构建详情
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Build"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      tags: [builds]
+      operationId: updateBuild
+      summary: 修改构建主数据
+      parameters:
+        - $ref: "#/components/parameters/IDPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateBuildRequest"
+      responses:
+        "200":
+          description: 修改后的构建
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Build"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /api/v1/agent/approvals:
+    get:
+      tags: [agent]
+      operationId: listPendingApprovals
+      summary: 待审批队列（与守卫生效判定同源）
+      responses:
+        "200":
+          description: 队列（可能为空数组）
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/PendingApproval"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+
+  /api/v1/agent/approvals/{trace_id}/approve:
+    post:
+      tags: [agent]
+      operationId: approvePendingAction
+      summary: 批准一条待审批留痕（人类专属）
+      parameters:
+        - $ref: "#/components/parameters/TraceIDPath"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ApprovalDecisionRequest"
+      responses:
+        "200":
+          description: 决策留痕
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApprovalDecision"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /api/v1/agent/approvals/{trace_id}/reject:
+    post:
+      tags: [agent]
+      operationId: rejectPendingAction
+      summary: 驳回一条待审批留痕（人类专属）
+      parameters:
+        - $ref: "#/components/parameters/TraceIDPath"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ApprovalDecisionRequest"
+      responses:
+        "200":
+          description: 决策留痕
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApprovalDecision"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /api/v1/agent/sessions:
+    get:
+      tags: [agent]
+      operationId: listAgentSessions
+      summary: Agent 会话列表
+      responses:
+        "200":
+          description: 会话列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/AgentSession"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+    post:
+      tags: [agent]
+      operationId: createAgentSession
+      summary: 登记 Agent 会话（人类专属）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAgentSessionRequest"
+      responses:
+        "201":
+          description: 已登记的会话
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentSession"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /api/v1/agent/sessions/{agent_id}/revoke:
+    post:
+      tags: [agent]
+      operationId: revokeAgentSession
+      summary: 吊销 Agent 会话（人类专属，软删）
+      parameters:
+        - $ref: "#/components/parameters/AgentIDPath"
+      responses:
+        "204":
+          description: 已吊销
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/roles:
+    get:
+      tags: [account]
+      operationId: listRoles
+      summary: 角色列表（5 个内置角色）
+      responses:
+        "200":
+          description: 角色列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Role"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /api/v1/roles/{code}/permissions:
+    get:
+      tags: [account]
+      operationId: getRolePermissions
+      summary: 某角色的权限矩阵（12 资源 × 4 动作 = 48 格）
+      parameters:
+        - $ref: "#/components/parameters/RoleCodePath"
+      responses:
+        "200":
+          description: 角色及其权限格
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RolePermissions"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /api/v1/users/{id}/permissions:
+    get:
+      tags: [account]
+      operationId: getUserPermissions
+      summary: 某用户的有效权限（本人或 admin 可查）
+      parameters:
+        - $ref: "#/components/parameters/UserIDPath"
+      responses:
+        "200":
+          description: 角色列表与权限并集（48 格）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserPermissions"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /api/v1/users/{id}/roles:
+    get:
+      tags: [account]
+      operationId: getUserRoles
+      summary: 某用户的角色列表（本人或 admin 可查）
+      parameters:
+        - $ref: "#/components/parameters/UserIDPath"
+      responses:
+        "200":
+          description: 角色列表
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserRoles"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    post:
+      tags: [account]
+      operationId: bindUserRole
+      summary: 绑定角色（admin 专属，幂等）
+      parameters:
+        - $ref: "#/components/parameters/UserIDPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BindRoleRequest"
+      responses:
+        "201":
+          description: 绑定后的角色列表
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserRoles"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /api/v1/users/{id}/roles/{role}/revoke:
+    post:
+      tags: [account]
+      operationId: unbindUserRole
+      summary: 解绑角色（admin 专属，软删；禁止解绑最后一个 admin）
+      parameters:
+        - $ref: "#/components/parameters/UserIDPath"
+        - $ref: "#/components/parameters/RoleCodePath"
+      responses:
+        "204":
+          description: 已解绑
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+
+  /api/v1/reports:
+    get:
+      tags: [report]
+      operationId: listReports
+      summary: 可用报表清单（6 张固定报表）
+      responses:
+        "200":
+          description: 报表清单（集合恒定在 data 键下）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ReportMeta"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /api/v1/reports/{id}:
+    get:
+      tags: [report]
+      operationId: getReport
+      summary: 执行单张报表（可选 product_id 过滤）
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: product_id
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+      responses:
+        "200":
+          description: 报表结果（columns 为稳定列顺序，rows 为对象数组）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReportResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /api/v1/audit/reports:
+    get:
+      tags: [audit]
+      operationId: listAuditReports
+      summary: 可用审计报表清单（3 张）
+      description: 数据来自留痕（traces），可见性沿用 trace.view——访客看不到。
+      responses:
+        "200":
+          description: 审计报表清单（集合恒定在 data 键下）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/AuditReportMeta"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /api/v1/audit/reports/{id}:
+    get:
+      tags: [audit]
+      operationId: getAuditReport
+      summary: 执行单张审计报表
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: 审计报表结果（columns 为稳定列顺序，rows 为对象数组）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuditReportResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthenticated"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: 登录或刷新获取的 access token，有效期 15 分钟。
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Regto-Api-Key
+      description: AI Agent 长期凭据；明文仅创建时回显一次。
+
+  parameters:
+    UserIDPath:
+      name: id
+      in: path
+      required: true
+      description: 用户 ID（正整数）
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    RoleCodePath:
+      name: code
+      in: path
+      required: true
+      description: 角色 code（admin|pm|dev|qa|guest）
+      schema:
+        type: string
+        enum: [admin, pm, dev, qa, guest]
+    IDPath:
+      name: id
+      in: path
+      required: true
+      description: 资源 ID（正整数）
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    Page:
+      name: page
+      in: query
+      description: 页码，从 1 开始；非法值回落 1
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    PerPage:
+      name: per_page
+      in: query
+      description: 每页条数；缺省 50，上限 200
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+    Sort:
+      name: sort
+      in: query
+      description: |
+        排序字段，逗号分隔；前缀 `-` 降序、`+` 升序。
+        允许字段：`created_at` `updated_at` `pri` `id` `title`。缺省 `-created_at`。
+      schema:
+        type: string
+        example: "-pri,created_at"
+    Keyword:
+      name: keyword
+      in: query
+      description: 标题模糊匹配（LIKE，`%` 与 `_` 按字面量转义），最长 255
+      schema:
+        type: string
+        maxLength: 255
+    StatusFilter:
+      name: status
+      in: query
+      description: 状态筛选，逗号分隔；非法值返回 400
+      schema:
+        type: string
+        example: "active,reviewing"
+    StageFilter:
+      name: stage
+      in: query
+      description: 阶段筛选，逗号分隔；非法值返回 400
+      schema:
+        type: string
+        example: "developing"
+    TypeFilter:
+      name: type
+      in: query
+      description: 需求类型筛选，逗号分隔
+      schema:
+        type: string
+        example: "story,epic"
+    ProductID:
+      name: product_id
+      in: query
+      description: 按产品筛选
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    ModuleID:
+      name: module_id
+      in: query
+      description: 按模块筛选
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    AssignedToID:
+      name: assigned_to_id
+      in: query
+      description: 按负责人筛选
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    OpenedByID:
+      name: opened_by_id
+      in: query
+      description: 按创建人筛选
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    IncludeDeleted:
+      name: include_deleted
+      in: query
+      description: 是否纳入软删记录；仅 `true` 生效
+      schema:
+        type: string
+        enum: ["true", "false"]
+        default: "false"
+    StoryID:
+      name: story_id
+      in: query
+      description: 按关联需求筛选（用例）
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    ExternalID:
+      name: external_id
+      in: query
+      description: 按 CI 侧标识筛选（如 go 测试函数名，精确匹配）
+      schema:
+        type: string
+        maxLength: 255
+    CaseSort:
+      name: sort
+      in: query
+      description: |
+        排序字段，逗号分隔；前缀 `-` 降序、`+` 升序。
+        允许字段：`id` `title` `pri` `status` `type` `created_at` `updated_at`。缺省 `-created_at`。
+      schema:
+        type: string
+        example: "-pri,id"
+    CaseStatusFilter:
+      name: status
+      in: query
+      description: 用例状态筛选（单值）；非法值返回 400
+      schema:
+        type: string
+        enum: [wait, normal, blocked, investigate]
+    CaseTypeFilter:
+      name: type
+      in: query
+      description: 用例类型筛选（单值）；非法值返回 400
+      schema:
+        type: string
+        enum: [feature, performance, config, install]
+    TaskStatusFilter:
+      name: status
+      in: query
+      description: 测试单状态筛选（单值）；非法值返回 400
+      schema:
+        type: string
+        enum: [wait, doing, done, blocked]
+    IfMatch:
+      name: If-Match
+      in: header
+      required: false
+      description: 乐观锁版本号（用例当前 version）；不匹配返回 412
+      schema:
+        type: integer
+
+    TraceIDPath:
+      name: trace_id
+      in: path
+      required: true
+      description: 留痕 ID（26 位 ULID）
+      schema:
+        type: string
+        minLength: 26
+        maxLength: 26
+    AgentIDPath:
+      name: agent_id
+      in: path
+      required: true
+      description: Agent 标识（≤64 字符）
+      schema:
+        type: string
+        maxLength: 64
+
+  responses:
+    Forbidden:
+      description: 主体无权执行该动作（human_only 档动作，AI 专属边界）
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    BadRequest:
+      description: 请求格式错误（非法 JSON、未知字段、非法查询参数）
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Unauthenticated:
+      description: 缺失或无效凭据
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    NotFound:
+      description: 资源不存在
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Conflict:
+      description: 并发冲突（乐观锁版本不匹配）
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Unprocessable:
+      description: 业务规则拒绝（非法状态转移 / 阶段回退 / 参数越界语义）
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    PreconditionFailed:
+      description: 乐观锁版本不匹配（If-Match 与当前 version 不一致）
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
+  schemas:
+
+    Problem:
+      type: object
+      description: RFC 7807 错误体
+      properties:
+        type:
+          type: string
+          format: uri
+          example: "https://regto.local/errors/INVALID_TRANSITION"
+        title:
+          type: string
+          example: Unprocessable Entity
+        status:
+          type: integer
+          example: 422
+        detail:
+          type: string
+          description: 5xx 时统一回显 "internal error"，不泄漏内部细节
+        code:
+          type: string
+          example: INVALID_TRANSITION
+        meta:
+          type: object
+          additionalProperties: true
+          description: 结构化补充信息（如 allowed / from / to / field）
+        request_id:
+          type: string
+      required: [type, title, status, detail]
+
+    # ---------- auth ----------
+
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        account:
+          type: string
+          minLength: 1
+        password:
+          type: string
+          minLength: 1
+      required: [account, password]
+
+    RefreshRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        refresh_token:
+          type: string
+          minLength: 1
+      required: [refresh_token]
+
+    TokenPair:
+      type: object
+      properties:
+        access_token:
+          type: string
+        refresh_token:
+          type: string
+        token_type:
+          type: string
+          example: Bearer
+        expires_in:
+          type: integer
+          description: access token 剩余秒数
+          example: 900
+        subject:
+          $ref: "#/components/schemas/Subject"
+      required: [access_token, refresh_token, token_type, expires_in, subject]
+
+    MeResponse:
+      type: object
+      description: 当前会话主体及其角色（角色只供前端菜单粗筛，不是判定依据）
+      properties:
+        subject:
+          $ref: "#/components/schemas/Subject"
+        roles:
+          type: array
+          description: 角色码；API Key / AI 主体为空数组
+          items:
+            type: string
+          example: [developer]
+      required: [subject, roles]
+
+    Subject:
+      type: object
+      description: 执行主体（human / ai / system）
+      properties:
+        kind:
+          type: string
+          enum: [human, ai, system]
+        id:
+          type: integer
+          format: int64
+        account:
+          type: string
+        agent_id:
+          type: string
+          description: AI Agent 标识（kind=ai 时非空）
+      required: [kind, id]
+
+    CreateAPIKeyRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+        subject_kind:
+          type: string
+          enum: [human, ai]
+          description: 缺省按 agent_id 推断
+        subject_id:
+          type: integer
+          format: int64
+          description: 缺省绑定创建者本人
+        agent_id:
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
+        ttl_days:
+          type: integer
+          minimum: 0
+          description: 有效天数；0 表示永不过期
+      required: [name]
+
+    APIKey:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        key:
+          type: string
+          description: 明文密钥；仅创建响应返回一次
+        key_prefix:
+          type: string
+          description: 可安全展示/记录的前缀
+        name:
+          type: string
+        subject_kind:
+          type: string
+          enum: [human, ai]
+        subject_id:
+          type: integer
+          format: int64
+        agent_id:
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
+        status:
+          type: string
+          enum: [active, revoked]
+        expires_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+      required: [id, key_prefix, name, subject_kind, subject_id, status, created_at]
+
+    # ---------- story ----------
+
+    CreateStoryRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        product_id:
+          type: integer
+          format: int64
+          minimum: 1
+        module_id:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+        title:
+          type: string
+          minLength: 1
+          maxLength: 255
+        type:
+          type: string
+          enum: [story, requirement, epic]
+          default: story
+        pri:
+          type: integer
+          minimum: 0
+        estimate:
+          type: number
+          nullable: true
+        spec:
+          type: string
+        verify:
+          type: string
+        reviewers:
+          type: array
+          items:
+            type: integer
+            format: int64
+        source_note:
+          type: string
+        as_draft:
+          type: boolean
+          description: true 时以草稿态创建，并把 reviewers 作为预设评审人
+      required: [product_id, title]
+
+    SpecInput:
+      type: object
+      additionalProperties: false
+      description: 变更动作使用的规格输入（缺省字段不覆盖原值）
+      properties:
+        title:
+          type: string
+          maxLength: 255
+        spec:
+          type: string
+        verify:
+          type: string
+        pri:
+          type: integer
+          minimum: 0
+        estimate:
+          type: number
+          nullable: true
+
+    TransitionRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        action:
+          type: string
+          enum:
+            - create
+            - submitReview
+            - reviewPass
+            - reviewClarify
+            - reviewRevert
+            - reviewReject
+            - change
+            - activate
+            - close
+        spec:
+          $ref: "#/components/schemas/SpecInput"
+        close_reason:
+          type: string
+          enum: [done, subdivided, duplicate, postponed, willnotdo, cancel, bydesign]
+          description: close 动作必填
+        review_results:
+          type: array
+          items:
+            type: string
+            enum: [pass, clarify, revert, reject]
+          description: 多人评审结果，按聚合规则收敛
+        reviewers:
+          type: array
+          items:
+            type: integer
+            format: int64
+        comment:
+          type: string
+        reviewer_id:
+          type: integer
+          format: int64
+          description: 缺省取当前执行主体 ID
+      required: [action]
+
+    AdvanceStageRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        stage:
+          type: string
+          enum:
+            - wait
+            - planned
+            - projected
+            - developing
+            - developed
+            - testing
+            - tested
+            - released
+      required: [stage]
+
+    SpecVersion:
+      type: object
+      properties:
+        version:
+          type: integer
+        title:
+          type: string
+        spec:
+          type: string
+        verify:
+          type: string
+      required: [version, title]
+
+    Story:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        product_id:
+          type: integer
+          format: int64
+        module_id:
+          type: integer
+          format: int64
+          nullable: true
+        title:
+          type: string
+        type:
+          type: string
+          enum: [story, requirement, epic]
+        pri:
+          type: integer
+        estimate:
+          type: number
+          nullable: true
+        status:
+          type: string
+          enum: [draft, reviewing, active, changing, closed]
+        stage:
+          type: string
+          enum: [wait, planned, projected, developing, developed, testing, tested, released]
+        spec_version:
+          type: integer
+          description: 当前规格版本号，从 1 开始
+        closed_reason:
+          type: string
+          enum: ["", done, subdivided, duplicate, postponed, willnotdo, cancel, bydesign, reviewrejected]
+        reviewers:
+          type: array
+          items:
+            type: integer
+            format: int64
+        opened_by_id:
+          type: integer
+          format: int64
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        current_spec:
+          $ref: "#/components/schemas/SpecVersion"
+      required:
+        [id, product_id, title, type, pri, status, stage, spec_version, opened_by_id, created_at, updated_at]
+
+    StoryListItem:
+      type: object
+      description: 列表投影；不含规格版本链（避免 N+1，DEC-04）
+      properties:
+        id:
+          type: integer
+          format: int64
+        product_id:
+          type: integer
+          format: int64
+        module_id:
+          type: integer
+          format: int64
+          nullable: true
+        title:
+          type: string
+        type:
+          type: string
+          enum: [story, requirement, epic]
+        pri:
+          type: integer
+        status:
+          type: string
+          enum: [draft, reviewing, active, changing, closed]
+        stage:
+          type: string
+          enum: [wait, planned, projected, developing, developed, testing, tested, released]
+        spec_version:
+          type: integer
+        closed_reason:
+          type: string
+        assigned_to_id:
+          type: integer
+          format: int64
+          nullable: true
+        opened_by_id:
+          type: integer
+          format: int64
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        deleted:
+          type: boolean
+          description: 软删标记；仅在 include_deleted=true 时出现
+      required:
+        [id, product_id, title, type, pri, status, stage, spec_version, opened_by_id, created_at, updated_at]
+
+    Page:
+      type: object
+      properties:
+        page:
+          type: integer
+        per_page:
+          type: integer
+        total:
+          type: integer
+          format: int64
+        has_more:
+          type: boolean
+      required: [page, per_page, total, has_more]
+
+    ListLinks:
+      type: object
+      description: 回带当前全部筛选条件的导航链接，客户端可直接取用
+      properties:
+        next:
+          type: string
+        prev:
+          type: string
+
+    StoryList:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/StoryListItem"
+        page:
+          $ref: "#/components/schemas/Page"
+        links:
+          $ref: "#/components/schemas/ListLinks"
+      required: [data, page, links]
+
+    # ---------- 用例域 ----------
+
+    CreateCaseRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        product_id:
+          type: integer
+          format: int64
+          minimum: 1
+        module_id:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+        story_id:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+        story_version:
+          type: integer
+          minimum: 1
+          description: 关联需求锁定的版本；缺省 1
+        branch_id:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+        title:
+          type: string
+          minLength: 1
+          maxLength: 255
+        precondition:
+          type: string
+        keywords:
+          type: string
+          maxLength: 255
+        pri:
+          type: integer
+          minimum: 1
+          maximum: 4
+          default: 3
+        type:
+          type: string
+          enum: [feature, performance, config, install]
+          default: feature
+        external_id:
+          type: string
+          maxLength: 255
+          description: CI 侧标识（如 go 测试函数名）；go test -json 导入的匹配键
+      required: [product_id, title]
+
+    UpdateCaseRequest:
+      type: object
+      additionalProperties: false
+      description: 全字段可选，空值不覆盖原值
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 255
+        precondition:
+          type: string
+        keywords:
+          type: string
+          maxLength: 255
+        pri:
+          type: integer
+          minimum: 1
+          maximum: 4
+        type:
+          type: string
+          enum: [feature, performance, config, install]
+        module_id:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+        story_id:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+        story_version:
+          type: integer
+          minimum: 1
+
+    CaseTransitionRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        action:
+          type: string
+          enum: [activate, block, investigate, resume]
+      required: [action]
+
+    ImportZTFRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        ztf:
+          type: string
+          minLength: 1
+          description: ZTF 文本（`>>>` 标题行 / `***` 步骤 / `>>` 检查点 / `**` 分组）
+        default_product_id:
+          type: integer
+          format: int64
+          minimum: 1
+          description: 用例块未带 @产品 时的默认归属；未提供且块无产品则 400
+      required: [ztf]
+
+    ImportZTFResponse:
+      type: object
+      properties:
+        total:
+          type: integer
+          description: 解析出的用例块数
+        created:
+          type: integer
+          description: 实际导入的用例数
+        cases:
+          type: array
+          items:
+            $ref: "#/components/schemas/Case"
+      required: [total, created, cases]
+
+    Step:
+      type: object
+      properties:
+        seq:
+          type: integer
+          description: 步骤序号，从 1 起连续递增
+        name:
+          type: string
+          description: 步骤描述
+        expect:
+          type: string
+          description: 期望结果；分组步骤为空。多检查点以换行合并
+        step_type:
+          type: string
+          enum: [step, group]
+      required: [seq, name, step_type]
+
+    Case:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        product_id:
+          type: integer
+          format: int64
+        module_id:
+          type: integer
+          format: int64
+          nullable: true
+        story_id:
+          type: integer
+          format: int64
+          nullable: true
+        story_version:
+          type: integer
+        branch_id:
+          type: integer
+          format: int64
+          nullable: true
+        title:
+          type: string
+        precondition:
+          type: string
+        keywords:
+          type: string
+        pri:
+          type: integer
+        type:
+          type: string
+          enum: [feature, performance, config, install]
+        status:
+          type: string
+          enum: [wait, normal, blocked, investigate]
+        version:
+          type: integer
+        source_ref:
+          type: string
+          description: 非空 = SpecDD 派生用例（TEST yaml 的 TC-xx）；空 = 业务用例
+        external_id:
+          type: string
+        suite:
+          type: string
+          description: spec sync 写入的套件名（SpecDD 用例）
+        last_run_result:
+          type: string
+          enum: ["", pass, fail, blocked, skip, n/a]
+          description: 最近一次执行结论（冗余展示列）
+        last_runner:
+          type: string
+        opened_by_id:
+          type: integer
+          format: int64
+        opened_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        steps:
+          type: array
+          items:
+            $ref: "#/components/schemas/Step"
+          description: 详情返回；列表不返回
+      required:
+        [id, product_id, title, pri, type, status, version, story_version, opened_by_id, opened_at, updated_at]
+
+    CaseList:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Case"
+        page:
+          $ref: "#/components/schemas/Page"
+        links:
+          $ref: "#/components/schemas/ListLinks"
+      required: [data, page, links]
+
+    CreateSuiteRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        product_id:
+          type: integer
+          format: int64
+          minimum: 1
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+        desc:
+          type: string
+      required: [product_id, name]
+
+    Suite:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        product_id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        desc:
+          type: string
+      required: [id, product_id, name]
+
+    AddSuiteCaseRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        case_id:
+          type: integer
+          format: int64
+          minimum: 1
+        version:
+          type: integer
+          minimum: 1
+          description: 锁定的用例版本快照；缺省取用例当前版本
+      required: [case_id]
+
+    SuiteCase:
+      type: object
+      properties:
+        suite_id:
+          type: integer
+          format: int64
+        case_id:
+          type: integer
+          format: int64
+        version:
+          type: integer
+      required: [suite_id, case_id, version]
+
+    # ---------- 测试执行域 ----------
+
+    CreateTestTaskRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+        product_id:
+          type: integer
+          format: int64
+          minimum: 1
+        project_id:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+        type:
+          type: string
+          description: 测试单类型（如 regression/smoke），自由文本
+        owner_id:
+          type: integer
+          format: int64
+          description: 负责人；缺省取当前执行主体
+        pri:
+          type: integer
+          minimum: 1
+          maximum: 4
+          default: 3
+        desc:
+          type: string
+      required: [name, product_id]
+
+    TestTaskTransitionRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        action:
+          type: string
+          enum: [start, finish, block]
+      required: [action]
+
+    TestTask:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        product_id:
+          type: integer
+          format: int64
+        project_id:
+          type: integer
+          format: int64
+          nullable: true
+        build_id:
+          type: integer
+          format: int64
+          nullable: true
+          description: 预留（M2-B 构建域），本期恒空
+        type:
+          type: string
+        owner_id:
+          type: integer
+          format: int64
+        pri:
+          type: integer
+        status:
+          type: string
+          enum: [wait, doing, done, blocked]
+        desc:
+          type: string
+        begin:
+          type: string
+          format: date-time
+        end:
+          type: string
+          format: date-time
+        opened_by_id:
+          type: integer
+          format: int64
+        opened_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+      required: [id, name, product_id, owner_id, pri, status, opened_by_id, opened_at, updated_at]
+
+    TestTaskList:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/TestTask"
+        page:
+          $ref: "#/components/schemas/Page"
+        links:
+          $ref: "#/components/schemas/ListLinks"
+      required: [data, page, links]
+
+    AddCasesRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        case_ids:
+          type: array
+          minItems: 1
+          items:
+            type: integer
+            format: int64
+            minimum: 1
+      required: [case_ids]
+
+    TaskCase:
+      type: object
+      properties:
+        case_id:
+          type: integer
+          format: int64
+        case_version:
+          type: integer
+          description: 加入时锁定的用例版本
+        case_title:
+          type: string
+        status:
+          type: string
+          enum: [wait, running, done]
+        last_run_result:
+          type: string
+          enum: ["", pass, fail, blocked, skip, n/a]
+      required: [case_id, case_version, case_title, status]
+
+    TaskCaseList:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/TaskCase"
+      required: [data]
+
+    ImportResultRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        events:
+          type: string
+          minLength: 1
+          description: go test -json 原始输出（一行一个 JSON 对象）
+        product_id:
+          type: integer
+          format: int64
+          minimum: 1
+          description: 匹配用例的产品维度（external_id 在产品内唯一）
+        actor_type:
+          type: string
+          enum: [human, ai, system]
+          description: 缺省从认证上下文推导；无上下文时 ai
+        actor_id:
+          type: string
+          maxLength: 64
+          description: 执行主体标识（AI=agent_id，人类=登录名）；缺省 regto-coder
+        trace_id:
+          type: string
+          maxLength: 26
+          description: 关联留痕链；缺省服务端生成 ULID
+        run_no:
+          type: integer
+          minimum: 1
+          description: 执行轮次；缺省取已有最大 + 1
+        create_missing:
+          type: boolean
+          description: 未匹配用例时按测试名自动建档（默认 false → 400 UNMATCHED_TESTS）
+        dry_run:
+          type: boolean
+          description: 只解析与匹配，不写库
+      required: [events, product_id]
+
+    Result:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        case_id:
+          type: integer
+          format: int64
+        case_version:
+          type: integer
+        run_no:
+          type: integer
+        result:
+          type: string
+          enum: [pass, fail, blocked, skip, n/a]
+        duration_ms:
+          type: integer
+        actor_type:
+          type: string
+          enum: [human, ai, system]
+        actor_id:
+          type: string
+        trace_id:
+          type: string
+        executed_at:
+          type: string
+          format: date-time
+      required: [id, case_id, case_version, run_no, result, duration_ms, actor_type, actor_id, executed_at]
+
+    ResultList:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Result"
+        page:
+          $ref: "#/components/schemas/Page"
+        links:
+          $ref: "#/components/schemas/ListLinks"
+      required: [data, page, links]
+
+    ImportResultResponse:
+      type: object
+      properties:
+        test_task_id:
+          type: integer
+          format: int64
+        run_no:
+          type: integer
+        total:
+          type: integer
+          description: 解析出的测试数
+        written:
+          type: integer
+          description: 实际写入的结果数（dry_run 时为预览数）
+        matched:
+          type: integer
+        created:
+          type: integer
+          description: create_missing 自动建档的用例数
+        by_result:
+          type: object
+          description: 结果 → 数量
+          additionalProperties:
+            type: integer
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/Result"
+      required: [test_task_id, run_no, total, written, matched, created, by_result, results]
+
+    # ---------- 发布域：产品计划 ----------
+
+    Plan:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        product_id:
+          type: integer
+          format: int64
+        branch_id:
+          type: integer
+          format: int64
+          nullable: true
+        parent_id:
+          type: integer
+          format: int64
+          nullable: true
+          description: 父计划 ID（DEC-01 单表父子；空=顶层）
+        title:
+          type: string
+        status:
+          type: string
+          enum: [wait, doing, done, closed]
+        desc:
+          type: string
+        begin:
+          type: string
+          description: 计划开始日期 YYYY-MM-DD
+        end:
+          type: string
+          description: 计划结束日期 YYYY-MM-DD
+        finished_at:
+          type: string
+          description: finish 转移时记录（RFC3339）
+        closed_at:
+          type: string
+        closed_reason:
+          type: string
+        opened_by_id:
+          type: integer
+          format: int64
+        opened_at:
+          type: string
+        updated_at:
+          type: string
+      required: [id, product_id, title, status, opened_by_id, opened_at, updated_at]
+
+    PlanList:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Plan"
+        page:
+          $ref: "#/components/schemas/Page"
+        links:
+          $ref: "#/components/schemas/ListLinks"
+      required: [data, page, links]
+
+    CreatePlanRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        product_id:
+          type: integer
+          format: int64
+          minimum: 1
+        branch_id:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+        parent_id:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+        title:
+          type: string
+          minLength: 1
+          maxLength: 255
+        desc:
+          type: string
+        begin:
+          type: string
+          description: YYYY-MM-DD
+        end:
+          type: string
+          description: YYYY-MM-DD；不得早于 begin
+      required: [product_id, title]
+
+    UpdatePlanRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        title:
+          type: string
+          minLength: 1
+        desc:
+          type: string
+        begin:
+          type: string
+        end:
+          type: string
+
+    PlanTransitionRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        action:
+          type: string
+          enum: [start, finish, close, activate]
+        reason:
+          type: string
+          description: close 时写入 closed_reason
+      required: [action]
+
+    PlanStory:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        plan_id:
+          type: integer
+          format: int64
+        story_id:
+          type: integer
+          format: int64
+        order:
+          type: integer
+      required: [id, plan_id, story_id, order]
+
+    PlanStoryList:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/PlanStory"
+      required: [data]
+
+    LinkPlanStoryRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        story_id:
+          type: integer
+          format: int64
+          minimum: 1
+      required: [story_id]
+
+    # ---------- 发布域：发布 ----------
+
+    Release:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        product_id:
+          type: integer
+          format: int64
+        branch_id:
+          type: integer
+          format: int64
+          nullable: true
+        name:
+          type: string
+        system:
+          type: string
+          enum: [trunk, branch]
+        marker:
+          type: boolean
+          description: 里程碑发布
+        status:
+          type: string
+          enum: [wait, normal, fail, terminate]
+        date:
+          type: string
+          description: 计划发布日期 YYYY-MM-DD
+        released_at:
+          type: string
+          description: publish 转移时记录（RFC3339）
+        story_ids:
+          type: string
+          description: 逗号串快照（DEC-04）
+        bug_ids:
+          type: string
+        build_ids:
+          type: string
+        mailto:
+          type: string
+        notify:
+          type: string
+        desc:
+          type: string
+        opened_by_id:
+          type: integer
+          format: int64
+        opened_at:
+          type: string
+        updated_at:
+          type: string
+      required: [id, product_id, name, system, marker, status, opened_by_id, opened_at, updated_at]
+
+    ReleaseList:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Release"
+        page:
+          $ref: "#/components/schemas/Page"
+        links:
+          $ref: "#/components/schemas/ListLinks"
+      required: [data, page, links]
+
+    CreateReleaseRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        product_id:
+          type: integer
+          format: int64
+          minimum: 1
+        branch_id:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+        system:
+          type: string
+          enum: [trunk, branch]
+          default: trunk
+        marker:
+          type: boolean
+        date:
+          type: string
+          description: YYYY-MM-DD
+        desc:
+          type: string
+      required: [product_id, name]
+
+    UpdateReleaseRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+        date:
+          type: string
+        desc:
+          type: string
+        mailto:
+          type: string
+        notify:
+          type: string
+
+    ReleaseTransitionRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        action:
+          type: string
+          enum: [publish, pause, terminate, play]
+      required: [action]
+
+    # ---------- 发布域：构建（无状态机，DEC-06） ----------
+
+    Build:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        product_id:
+          type: integer
+          format: int64
+        project_id:
+          type: integer
+          format: int64
+          nullable: true
+          description: 所属迭代
+        name:
+          type: string
+        builds:
+          type: string
+          description: 构建号（产品内唯一）
+        system:
+          type: string
+          enum: [trunk, branch]
+        scm_path:
+          type: string
+        file_path:
+          type: string
+        date:
+          type: string
+        builder:
+          type: string
+        story_ids:
+          type: string
+        bug_ids:
+          type: string
+        desc:
+          type: string
+        created_by_id:
+          type: integer
+          format: int64
+        created_at:
+          type: string
+        updated_at:
+          type: string
+      required: [id, product_id, name, builds, system, created_by_id, created_at, updated_at]
+
+    BuildList:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Build"
+        page:
+          $ref: "#/components/schemas/Page"
+        links:
+          $ref: "#/components/schemas/ListLinks"
+      required: [data, page, links]
+
+    CreateBuildRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        product_id:
+          type: integer
+          format: int64
+          minimum: 1
+        project_id:
+          type: integer
+          format: int64
+          minimum: 1
+          nullable: true
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+        builds:
+          type: string
+          minLength: 1
+          maxLength: 255
+        system:
+          type: string
+          enum: [trunk, branch]
+          default: trunk
+        date:
+          type: string
+          description: YYYY-MM-DD
+        builder:
+          type: string
+        desc:
+          type: string
+      required: [product_id, name, builds]
+
+    UpdateBuildRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+        builds:
+          type: string
+          minLength: 1
+        date:
+          type: string
+        builder:
+          type: string
+        scm_path:
+          type: string
+        file_path:
+          type: string
+        desc:
+          type: string
+
+    PendingApproval:
+      type: object
+      additionalProperties: false
+      properties:
+        trace_id:
+          type: string
+        seq:
+          type: integer
+          format: int64
+        action:
+          type: string
+        actor_type:
+          type: string
+          enum: [human, ai, system]
+        actor_id:
+          type: string
+        object_type:
+          type: string
+        object_id:
+          type: string
+        object_ref:
+          type: string
+        summary:
+          type: string
+        occurred_at_ms:
+          type: integer
+          format: int64
+      required: [trace_id, seq, action, actor_id, summary]
+
+    EmbedTokenResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        access_token:
+          type: string
+          description: 短 TTL JWT；按标准 Bearer 用法放入 Authorization 头。
+        token_type:
+          type: string
+        expires_in:
+          type: integer
+          format: int64
+          description: 有效期秒数（默认 300）
+      required: [access_token, token_type, expires_in]
+    ApprovalDecisionRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        comment:
+          type: string
+
+    ApprovalDecision:
+      type: object
+      additionalProperties: false
+      properties:
+        trace_id:
+          type: string
+        seq:
+          type: integer
+          format: int64
+        action:
+          type: string
+          enum: [approve, reject]
+        target_trace_id:
+          type: string
+      required: [trace_id, seq, action, target_trace_id]
+
+    AgentSession:
+      type: object
+      additionalProperties: false
+      properties:
+        id:
+          type: integer
+          format: int64
+        agent_id:
+          type: string
+        display_name:
+          type: string
+        model:
+          type: string
+        capabilities:
+          type: array
+          items:
+            type: string
+        approval_policy:
+          type: object
+          additionalProperties:
+            type: string
+            enum: [auto, approval, human_only]
+        owner_id:
+          type: integer
+          format: int64
+        status:
+          type: string
+          enum: [active, revoked]
+        created_at_ms:
+          type: integer
+          format: int64
+        expires_at_ms:
+          type: integer
+          format: int64
+      required: [id, agent_id, display_name, capabilities, status, created_at_ms]
+
+    CreateAgentSessionRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        agent_id:
+          type: string
+          minLength: 1
+          maxLength: 64
+        display_name:
+          type: string
+          maxLength: 128
+        model:
+          type: string
+        capabilities:
+          type: array
+          items:
+            type: string
+        approval_policy:
+          type: object
+          additionalProperties:
+            type: string
+            enum: [auto, approval, human_only]
+        owner_id:
+          type: integer
+          format: int64
+        expires_at_ms:
+          type: integer
+          format: int64
+      required: [agent_id, capabilities]
+
+    Role:
+      type: object
+      properties:
+        code:
+          type: string
+          enum: [admin, pm, dev, qa, guest]
+        name:
+          type: string
+        description:
+          type: string
+        builtin:
+          type: boolean
+      required: [code, name, builtin]
+
+    Permission:
+      type: object
+      description: 矩阵的一格。只给结论，不带理由——单格没有判定上下文。
+      properties:
+        resource:
+          type: string
+          enum: [product, project, story, case, suite, testtask, plan, release, build, spec, trace, agent]
+        action:
+          type: string
+          enum: [view, create, edit, delete]
+        allowed:
+          type: boolean
+      required: [resource, action, allowed]
+
+    RolePermissions:
+      type: object
+      properties:
+        role:
+          $ref: "#/components/schemas/Role"
+        permissions:
+          type: array
+          items:
+            $ref: "#/components/schemas/Permission"
+      required: [role, permissions]
+
+    UserPermissions:
+      type: object
+      properties:
+        user_id:
+          type: integer
+          format: int64
+        roles:
+          type: array
+          items:
+            type: string
+        permissions:
+          type: array
+          description: 多角色权限的并集（48 格，拒绝项也在，allowed=false）
+          items:
+            $ref: "#/components/schemas/Permission"
+      required: [user_id, roles, permissions]
+
+    UserRoles:
+      type: object
+      properties:
+        user_id:
+          type: integer
+          format: int64
+        roles:
+          type: array
+          items:
+            type: string
+      required: [user_id, roles]
+
+    ReportMeta:
+      type: object
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        description:
+          type: string
+        category:
+          type: string
+        scoped:
+          type: boolean
+          description: 是否支持 product_id 过滤
+      required: [id, title, description, category, scoped]
+
+    AuditReportMeta:
+      type: object
+      required: [id, title, description, category]
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        description:
+          type: string
+        category:
+          type: string
+    AuditReportResponse:
+      type: object
+      required: [id, title, generated_at, columns, rows]
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        generated_at:
+          type: string
+          format: date-time
+        columns:
+          type: array
+          items:
+            type: string
+        rows:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+    ReportResponse:
+      type: object
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        generated_at:
+          type: string
+          format: date-time
+        columns:
+          type: array
+          items:
+            type: string
+        rows:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+      required: [id, title, generated_at, columns, rows]
+    BindRoleRequest:
+      type: object
+      properties:
+        role:
+          type: string
+          enum: [admin, pm, dev, qa, guest]
+      required: [role]
